@@ -1,5 +1,7 @@
 # Computer-Networks-Server-Cleint-Architecture-Simulation
 
+Although the architecture folders contain the explanantion for the two architectures separately, I still give some rough broad outline about both the client-server architectures used here.
+
 ## Architecture 1 Explanation
 Multi-channel stop-and-wait protocol without DATA or ACK losses.
 1. The sender transmits packets through two different channels (TCP connections).
