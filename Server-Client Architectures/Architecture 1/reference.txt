@@ -1,0 +1,613 @@
+
+/* -----------------------------------------------------------------
+CLIENT SIDE CODE
+FORKING HAS BEEN USED
+---------------------------------------------------------------------*/
+
+#include <stdio.h>  
+#include <string.h>     
+#include <stdlib.h>  
+#include <errno.h>  
+#include <unistd.h>     
+#include <arpa/inet.h>    
+#include <sys/types.h>  
+#include <sys/wait.h>
+#include <sys/stat.h>    
+#include <sys/socket.h>  
+#include <netinet/in.h>  
+#include <fcntl.h>
+#include <unistd.h>
+#include <semaphore.h>
+#include <sys/time.h> 
+#include<sys/poll.h>
+
+#define PAYLOAD_SIZE 100
+#define TIMEOUT_SECS 2
+#define BUFFER_SIZE 5
+#define SEM_NAME "/asda"
+
+int file_size_calculator(char *name)
+{
+    FILE* fp = fopen(name,"ab");
+    if(fp==NULL)
+    {
+        printf("\n Error in opening file %s", name);
+        exit(0);
+    }
+    fseek(fp, 0, SEEK_END);
+    int filesize = ftell(fp);
+    fclose(fp);
+    return filesize;
+}
+
+void clear_data(char* data)
+{
+    for(int i=0;i<PAYLOAD_SIZE;i++)
+    data[i]='\0';
+}
+
+typedef struct packet{
+
+    int bytes_in_data;
+    int sequence_number;
+    int last;
+    int is_data;
+    int chanel;
+    char data[PAYLOAD_SIZE+1];
+}packet;
+
+
+
+int main()
+{
+    
+    sem_t *sem = sem_open(SEM_NAME, O_CREAT | O_EXCL, (S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP), 1);
+
+    int file_size = file_size_calculator("input.txt");
+    FILE* fp = fopen("input.txt","r");
+    setvbuf(fp, (char *)NULL, _IONBF, 0);
+    // setvbuf(stdout, (char *)NULL, _IONBF, 0);
+    
+    int process_id = fork();
+
+    // create the socket 
+    int socket_id =  socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (socket_id < 0) 
+    { 
+        printf ("Error in opening a socket"); 
+        exit (0);
+    }
+    if(process_id==0) printf ("Client Socket Chanel 1 is created\n");
+    else printf ("Client Socket Chanel 2 is created\n");
+
+    // create the server_address structure
+    struct sockaddr_in server_address;
+    memset (&server_address,0,sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = htons(12345); 
+    server_address.sin_addr.s_addr = inet_addr("192.168.1.7"); 
+
+    //connect to the server
+    if(connect(socket_id, (struct sockaddr*) &server_address , sizeof(server_address)) < 0 )
+    {
+        printf("Error in establishing connection");
+        exit(0);
+    }
+    if(process_id==0) printf("TCP Connection Chanel 1 Successfully Established... \n");
+    else printf("TCP Connection Chanel 2 Successfully Established... \n");
+
+    int done = 0;
+    while(done == 0 )
+    {        
+        // printf("Stuck here 1");
+
+        sem_t *sema = sem_open(SEM_NAME, O_RDWR);
+
+        packet data_packet;
+        memset(&data_packet,0,sizeof(data_packet));
+
+        if(process_id==0) data_packet.chanel = 1;
+        else data_packet.chanel = 2;
+        
+        data_packet.is_data = 1;
+        clear_data(data_packet.data);
+
+        sem_wait(sema);
+        data_packet.sequence_number = ftell(fp);
+
+        //Read the file content in the data part
+        fread(&(data_packet.data),1,PAYLOAD_SIZE,fp);
+
+        sem_post(sema);
+
+        if(data_packet.sequence_number+PAYLOAD_SIZE<file_size)
+        {
+            data_packet.last = 0;
+            data_packet.bytes_in_data = PAYLOAD_SIZE;
+        }    
+        else 
+        {
+            data_packet.last = 1;
+            data_packet.bytes_in_data = file_size - data_packet.sequence_number;
+        }
+      
+        //initiate the sending of the packet
+        if(send(socket_id, &data_packet, sizeof(data_packet), 0)!=sizeof(data_packet))
+        {
+            printf("Error while sending the message");
+            exit(0);
+        }
+        
+        printf("SENT PACKET: Sequence Number %d  of size %d bytes from chanel %d \n",
+        data_packet.sequence_number, data_packet.bytes_in_data, data_packet.chanel);
+        
+        // initialise the polling structure
+        struct pollfd file_descriptors[1];
+        int num_fds = 1;
+        memset(file_descriptors, 0 , sizeof(file_descriptors));
+        file_descriptors[0].fd = socket_id;
+        file_descriptors[0].events = POLLIN;
+
+        int premature_timeout=0;
+        
+
+        while(1)
+        {
+            // printf("Stuck here 2\n");
+            
+            //initialise the timeout
+            int timeout = TIMEOUT_SECS * 1000;
+
+            //wait on the polling function
+            memset(file_descriptors, 0 , sizeof(file_descriptors));
+            file_descriptors[0].fd = socket_id;
+            file_descriptors[0].events = POLLIN;
+            int return_count = poll(file_descriptors, num_fds, timeout);
+
+            printf("return_count is %d\n",return_count);
+
+            if(return_count<0)
+            {
+                printf("Error occured on poll() function!\n");
+                break;
+            }
+            else if(return_count == 0)
+            {
+            
+                if(process_id==0) printf("Timeout on chanel 1 for sequence number %d packet \n", data_packet.sequence_number);
+                else printf("Timeout on chanel 2 for sequence number % d packet \n", data_packet.sequence_number);
+
+                //SEND THE SAME DATA AGAIN HERE
+                if(send(socket_id, &data_packet, sizeof(data_packet), 0)!=sizeof(data_packet))
+                {
+                    printf("Error while sending the message");
+                    exit(0);
+                }
+                
+                printf("(RE)SENT PACKET: Sequence Number %d  of size %d bytes from chanel %d \n",
+                data_packet.sequence_number, data_packet.bytes_in_data, data_packet.chanel);
+                continue;
+            }
+            else if(file_descriptors[0].revents == POLLIN)
+            {
+                packet ack_packet;
+                int number= recv(socket_id,&ack_packet,sizeof(ack_packet),0);
+
+                if(number<0)
+                {
+                    printf("Error in receiving ACK for packet\n");
+                    exit(0);
+                }
+                else if(number==0)
+                {
+                    printf("Server closed\n");
+                    fclose(fp);
+                    close(socket_id);
+                    sem_unlink(SEM_NAME); 
+                    exit(0);
+                    break;
+                }
+                else
+                {
+
+                    printf("expecting ACK of %d from chanel %d\n", data_packet.sequence_number, (process_id==0)?1:2);
+                    
+                    
+                    printf("RECEIVED ACK: Sequence number %d from chanel %d \n",
+                    ack_packet.sequence_number,ack_packet.chanel);
+                    
+                    // just check this number cause we need to avoid being confused be previous acks 
+                    // from a pre-mature timeout before that occurs due to windows simulator on my machine
+                    // and because ftell and fread are not atomic operations and I am using fork. So the 
+                    // context switch happens in between these two, leading to change in SEQ numbers 
+
+                    if(ack_packet.sequence_number < data_packet.sequence_number)
+                    {
+                        // if(premature_timeout<10)
+                        // {    
+                        //     premature_timeout++;
+                        //     continue;
+                        // }
+                        // else 
+                        // {
+                        //     premature_timeout = 0;
+                        //     int offset = (data_packet.sequence_number - BUFFER_SIZE*PAYLOAD_SIZE);
+                        //     printf("Did it...made %d to %d \n",data_packet.sequence_number,offset);
+                        //     fseek(fp,offset,SEEK_SET);
+                        // }  
+
+                        continue; 
+                    }
+                }
+
+                break;
+                
+            }
+        
+        }
+
+        if(ftell(fp)>=file_size)
+        done = 1;
+
+        sem_close(sema);
+
+    }
+
+    fclose(fp);
+    close(socket_id);
+    sem_unlink(SEM_NAME); 
+
+    printf("End of process pid = %d \n", process_id);
+    
+    return 0;
+}
+
+
+
+/*---------------------------------------------------------------------------------
+SERVER SIDE CODE
+SIMILAR APPROACH AS MY FINAL APPROACH
+----------------------------------------------------------------------------------*/
+
+#include <stdio.h>  
+#include <string.h>     
+#include <stdlib.h>  
+#include <errno.h>  
+#include <unistd.h>     
+#include <arpa/inet.h>    
+#include <sys/types.h>  
+#include <sys/wait.h>
+#include <sys/stat.h>    
+#include <sys/socket.h>  
+#include <netinet/in.h>  
+#include <fcntl.h>
+#include <unistd.h>
+#include <semaphore.h>
+#include <time.h> 
+#include<sys/poll.h>
+
+#define PAYLOAD_SIZE 100 // this is only payload inside the packet ( as specified in question), header is separate
+#define MAX_CHANELS 10 // maximum chanels in the server in total
+#define TIMEOUT_SECS 2 // in seconds
+#define DROP_RATE 10 // percentage
+#define BUFFER_SIZE 5  // size of server side buffer in packets for out of order (hence keep it small)
+
+typedef struct packet{
+
+    int bytes_in_data;
+    int sequence_number;
+    int last;
+    int is_data;
+    int chanel;
+    char data[PAYLOAD_SIZE];
+}packet;
+
+void clear_data(char* data)
+{
+    for(int i=0;i<PAYLOAD_SIZE;i++)
+    data[i]='\0';
+}
+
+void print_packet(packet *p)
+{
+    printf("\nThe message received is the following: \n");
+    printf("bytes in data: %d\n", p->bytes_in_data);
+    printf("sequence_number: %d\n", p->sequence_number);
+    printf("last: %d\n", p->last);
+    printf("is_data: %d\n", p->is_data);
+    printf("chanel: %d\n", p->chanel);
+    printf("data: %s\n", p->data);
+}
+
+int write_to_buffer(packet *buffer, int* buffer_entries ,int *current_writer_offset, packet data_packet, FILE *fp)
+{
+    int value =0;
+    
+    if(data_packet.sequence_number == *current_writer_offset)
+    {
+        // write the contents of the packet
+        
+        if(data_packet.last==1)
+            value=1;
+        printf("Writing seq %d to the file here\n", data_packet.sequence_number);
+        fwrite(data_packet.data,1,data_packet.bytes_in_data,fp);
+        *current_writer_offset = *current_writer_offset + PAYLOAD_SIZE;
+        
+        
+        
+        // write the contents of all the buffered packets in order
+        if(*buffer_entries>0)
+        {
+            for(int i=0;i<BUFFER_SIZE;i++)
+                for(int j=0;j<BUFFER_SIZE;j++)
+                {
+                    if(buffer[j].sequence_number == *current_writer_offset)
+                    {
+                        printf("Writing seq %d to file from buffer\n", buffer[j].sequence_number);
+                        if(buffer[j].last==1)
+                            value=1;
+                            
+                        fwrite(buffer[j].data,1,buffer[j].bytes_in_data,fp);
+                        
+                        buffer[j].sequence_number = (-1);
+                        *current_writer_offset = *current_writer_offset + PAYLOAD_SIZE;
+                        break;
+                    }
+                }
+            
+            // reset the buffer as we emptied it
+            *buffer_entries = 0;
+        }
+
+        return value;
+
+    }
+    else if (data_packet.sequence_number > *current_writer_offset)
+    {
+        printf("Buffer option selected buffer is %d\n", *buffer_entries);
+
+        // find and fill an empty entry in the buffer
+        for(int i=0;i<BUFFER_SIZE;i++)
+        {
+            // Buffer already has the packet and client is giving again and again due to pre-mature timeout
+            if(buffer[i].sequence_number == data_packet.sequence_number)
+            {
+                printf("The seq num %d is already in buffer at position %d\n", data_packet.sequence_number,i);
+                break;
+            }    
+            // We have found an empty slot, so use it to buffer the packet
+            if(buffer[i].sequence_number < 0 || buffer[i].sequence_number%PAYLOAD_SIZE!=0)
+            {
+                buffer[i].sequence_number = data_packet.sequence_number;
+                buffer[i].last = data_packet.last;
+                buffer[i].is_data = data_packet.is_data;
+                clear_data(buffer[i].data);
+                strcpy(buffer[i].data,data_packet.data);
+                buffer[i].chanel = data_packet.chanel;
+                buffer[i].bytes_in_data = data_packet.bytes_in_data;
+                *buffer_entries = *buffer_entries + 1;  
+                printf("Writing seq %d to the buffer slot %d, buffer is now %d \n", data_packet.sequence_number, i,*buffer_entries);
+                break;
+            }
+            else 
+            {
+                // printf("Sequence number at slot %d is %d\n", i, buffer[i].sequence_number);
+                if(buffer[i].sequence_number < *current_writer_offset && buffer[i].sequence_number > 0)
+                    buffer[i].sequence_number = (-1);
+            }
+        }    
+
+        return value;
+
+        
+    }
+
+    return value;
+}
+
+
+int main()
+{
+    
+    // preprocessing steps
+    srand(time(0));
+    FILE* fp = fopen("output.txt","w");
+    setvbuf(fp, (char *)NULL, _IONBF, 0);
+
+    packet buffer[BUFFER_SIZE];
+
+    for(int i=0;i<BUFFER_SIZE;i++)
+        buffer[i].sequence_number = (-1);
+
+    // for(int i = 0;i<BUFFER_SIZE;i++)
+    // printf("seq %d ",buffer[i].sequence_number);
+    // printf("\n");
+
+    int current_writer_offset = 0;
+    int buffer_entries = 0;
+
+    // int arr[17]={51,51,45,51,51,45,51,51,45,51,51,51,51,51,51,51,51};
+    // int index = 0;
+
+    // create the socket number 1
+    int listening_socket =  socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listening_socket < 0) 
+    { 
+        printf ("Error in opening a socket"); 
+        exit (0);
+    }
+    printf ("Server Socket is created\n");
+
+    // create the server_address structure
+    struct sockaddr_in server_address, client_address;
+    memset (&server_address,0,sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = htons(12345); 
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY); 
+
+    // Binding the port 
+    if(bind(listening_socket, (struct sockaddr*) &server_address,sizeof(server_address))<0)
+    {
+        printf("Error in binding the server socket");
+        exit(0);
+    }
+    printf ("Binding is done \n");
+
+    // Listening 
+    if(listen(listening_socket,10)<0)
+    {
+        printf("Error while listening at the server");
+        exit(0);
+    }
+    printf ("Server is Listening now \n");
+
+    // initialise the polling structure
+    struct pollfd file_descriptors[MAX_CHANELS];
+    int num_fds = 1;
+    memset(file_descriptors, 0 , sizeof(file_descriptors));
+    file_descriptors[0].fd = listening_socket;
+    file_descriptors[0].events = POLLIN;
+
+    //initialise the timeout to block indefinitely. No timeout on server side
+    int timeout = (-1);
+
+    int done = 0;
+    while(done == 0)
+    {
+        //poll the descriptors
+        int return_count = poll(file_descriptors, num_fds, timeout);
+
+        if(return_count<0)
+        {
+            printf("Error occured on poll() function!\n");
+            break;
+        }
+        else if(return_count==0)
+        {
+            printf("Server timed out!\n");
+            exit(0);
+        }
+        else
+        {
+            for(int i=0;i<num_fds;i++)
+            {
+                if(file_descriptors[i].revents==0)
+                    continue;
+
+                // listening socket wants to be read
+                if(file_descriptors[i].fd == listening_socket)
+                {
+                    int new_socket = accept(listening_socket, NULL, NULL);
+
+                    if(new_socket<0)
+                        printf("Error in Accepting new connection\n");
+                    file_descriptors[num_fds].fd = new_socket;
+                    file_descriptors[num_fds].events = POLLIN;
+                    file_descriptors[num_fds].revents = 0;
+                    num_fds++;
+            
+                }
+                // == 0 means gracefully exited 
+                else
+                {
+                    packet data_packet,ack_packet;
+
+                    int number = recv(file_descriptors[i].fd,&data_packet, sizeof(data_packet),0);
+                    
+                    if(number<0)
+                    {
+                        printf("Error in receiving the bytes\n");
+                        exit(0);
+                    }
+                    else if(number==0)
+                    {
+                        file_descriptors[i].revents = 0;
+                    }
+                    else
+                    {
+                        
+                        printf("RECEIVED PACKET: Sequence number %d of size %d bytes from chanel %d \n",
+                        data_packet.sequence_number, data_packet.bytes_in_data, data_packet.chanel);
+
+                        printf("Current offset is %d \n", current_writer_offset);
+
+                        // do not send an ACK if the packet is to be dropped
+                        // continue to other fds that require your attention
+                        
+                        int decider = rand()%100;
+                        // printf("number generated: %d\n",decider);
+
+                        if(decider < DROP_RATE)
+                        {
+                            printf("Lost packet seq num %d on chanel %d \n", data_packet.sequence_number, data_packet.chanel);
+                            // index++;
+                            continue;
+                        }    
+                        // index++;
+
+                        // Write to the output file buffer
+                        if(buffer_entries >= BUFFER_SIZE && data_packet.sequence_number!=current_writer_offset)
+                        {
+                            printf("Buffer is full, rejecting packet sequence number %d \n ", data_packet.sequence_number);
+                            continue;
+                        }
+                        else if(data_packet.sequence_number >= current_writer_offset)
+                        {
+                            printf("Buffer is %d , calling write to buffer\n",buffer_entries);
+                            for(int i = 0;i<BUFFER_SIZE;i++)
+                            printf("seq %d ",buffer[i].sequence_number);
+                            printf("\n");
+
+                            int value = write_to_buffer(buffer,&buffer_entries,&current_writer_offset,data_packet,fp);
+                            
+                            // modifying same packet for convinience and sending it as ack 
+                            // by erasing data and changing required fields
+                            data_packet.is_data = 0;
+                            clear_data(data_packet.data);
+
+                            // printf("sending %d ACK \n",data_packet.sequence_number);
+                            if(send(file_descriptors[i].fd, &data_packet, sizeof(data_packet), 0)!=sizeof(data_packet))
+                            {
+                                printf("Error in sending the ACK\n");
+                                exit(0);
+                            }
+
+                            printf("SENT ACK: Sequence number %d from chanel %d \n",
+                            data_packet.sequence_number,  data_packet.chanel);
+
+                            printf("Current file pointer is at %d and buffer is %d and value is %d\n",current_writer_offset, buffer_entries, value);
+
+                            if(value == 1)
+                            {
+                                printf("Finishing work...\n");
+                                done=1;
+                            }
+                        }
+                        
+
+                    }
+
+                    file_descriptors[i].revents = 0;
+                    
+                }
+                
+            }
+        }
+        
+    }
+
+    for(int i=0;i<num_fds;i++)
+        close(file_descriptors[i].fd);
+    fclose(fp);
+
+    // printf("Proper end of server\n");
+
+   
+
+
+}
+
+
+/*---------------------------------------------------------------------
+THE END
+----------------------------------------------------------------------*/
